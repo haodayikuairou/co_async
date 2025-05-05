@@ -2,105 +2,175 @@
 #include <coroutine>
 #include "debug.hpp"
 
-struct PreviousAwaiter{
-    std::coroutine_handle<> mPrevious;
-        bool await_ready() const noexcept{return false;};                             // 是否立即就绪？true 表示不挂起
-    std::coroutine_handle<> await_suspend(std::coroutine_handle<> coroutine) const noexcept{
-        if(mPrevious) return mPrevious;
-        else return std::noop_coroutine();
-    } 
-    void await_resume() const noexcept{};  
+struct RepeatAwaiter {
+    bool await_ready() const noexcept { return false; }
+
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<> coroutine) const noexcept {
+        if (coroutine.done())
+            return std::noop_coroutine();
+        else
+            return coroutine;
+    }
+
+    void await_resume() const noexcept {}
 };
-struct Promise
-{
-    auto initial_suspend(){
+
+struct PreviousAwaiter {
+    std::coroutine_handle<> mPrevious;
+
+    bool await_ready() const noexcept { return false; }
+
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<> coroutine) const noexcept {
+        if (mPrevious)
+            return mPrevious;
+        else
+            return std::noop_coroutine();
+    }
+
+    void await_resume() const noexcept {}
+};
+
+template <class T>
+struct Promise {
+    auto initial_suspend() noexcept {
         return std::suspend_always();
     }
-    auto final_suspend() noexcept{
+
+    auto final_suspend() noexcept {
         return PreviousAwaiter(mPrevious);
     }
-    void unhandled_exception(){
-        throw;
+
+    void unhandled_exception() noexcept {
+        mException = std::current_exception();
     }
-    auto yield_value(int ret){
-        mRetValue=ret;
+
+    auto yield_value(T ret) noexcept {
+        new (&mResult) T(std::move(ret));
         return std::suspend_always();
     }
-    void return_void(){
 
+    void return_value(T ret) noexcept {
+        new (&mResult) T(std::move(ret));
     }
-    std::coroutine_handle<Promise> get_return_object(){
+
+    T result() {
+        if (mException) [[unlikely]] {
+            std::rethrow_exception(mException);
+        }
+        T ret = std::move(mResult);
+        mResult.~T();
+        return ret;
+    }
+
+    std::coroutine_handle<Promise> get_return_object() {
         return std::coroutine_handle<Promise>::from_promise(*this);
     }
-    int mRetValue;
-    std::coroutine_handle<> mPrevious=nullptr;
+
+    std::coroutine_handle<> mPrevious{};
+    std::exception_ptr mException{};
+    union {
+        T mResult;
+    };
+
+    Promise() noexcept {}
+    Promise(Promise &&) = delete;
+    ~Promise() {}
 };
-struct Task{
-    using promise_type=Promise;
 
-    Task(std::coroutine_handle<promise_type> coroutine)
-    :mCoroutine(coroutine){}
+template <>
+struct Promise<void> {
+    auto initial_suspend() noexcept {
+        return std::suspend_always();
+    }
 
-    std::coroutine_handle<promise_type> mCoroutine;
+    auto final_suspend() noexcept {
+        return PreviousAwaiter(mPrevious);
+    }
+
+    void unhandled_exception() noexcept {
+        mException = std::current_exception();
+    }
+
+    void return_void() noexcept {
+    }
+
+    void result() {
+        if (mException) [[unlikely]] {
+            std::rethrow_exception(mException);
+        }
+    }
+
+    std::coroutine_handle<Promise> get_return_object() {
+        return std::coroutine_handle<Promise>::from_promise(*this);
+    }
+
+    std::coroutine_handle<> mPrevious{};
+    std::exception_ptr mException{};
+
+ 
 };
 
-struct WorldTask{
-    using promise_type=Promise;
+template <class T>
+struct Task {
+    using promise_type = Promise<T>;
 
-    WorldTask(std::coroutine_handle<promise_type> coroutine)
-    :mCoroutine(coroutine){}
+    Task(std::coroutine_handle<promise_type> coroutine) noexcept
+        : mCoroutine(coroutine) {}
 
-    std::coroutine_handle<promise_type> mCoroutine;
-    struct WorldAwaiter{
-    bool await_ready() const noexcept{return false;};                             // 是否立即就绪？true 表示不挂起
-    std::coroutine_handle<> await_suspend(std::coroutine_handle<> coroutine) const noexcept{
-        mCoroutine.promise().mPrevious=coroutine;
-        return  mCoroutine;
-    } 
-    void await_resume() const noexcept{};  
-    std::coroutine_handle<promise_type> mCoroutine;
-    };                           
-    WorldTask(WorldTask &&)=delete;
-    ~WorldTask(){
+    Task(Task &&) = delete;
+
+    ~Task() {
         mCoroutine.destroy();
     }
-    auto operator co_await(){
-        return WorldAwaiter(mCoroutine);
+
+    struct Awaiter {
+        bool await_ready() const noexcept { return false; }
+
+        std::coroutine_handle<promise_type> await_suspend(std::coroutine_handle<> coroutine) const noexcept {
+            mCoroutine.promise().mPrevious = coroutine;
+            return mCoroutine;
+        }
+
+        T await_resume() const {
+            return mCoroutine.promise().result();
+        }
+
+        std::coroutine_handle<promise_type> mCoroutine;
+    };
+
+    auto operator co_await() const noexcept {
+        return Awaiter(mCoroutine);
     }
+
+    std::coroutine_handle<promise_type> mCoroutine;
 };
 
-WorldTask world(){
-    debug(),"world";
-    co_yield 442;
-    co_yield 447; 
-    co_return;
+Task<std::string> baby() {
+    debug(), "baby";
+    co_return "aaa\n";
 }
 
-Task hello(){
-    debug(),"hello doing worldTask";
-    WorldTask worldTask=world();
-    debug(),"hello done worldTask,wait world";
-    co_await worldTask;
-    debug(),"hello get world",worldTask.mCoroutine.promise().mRetValue; co_await worldTask;
-    co_await worldTask;
-    debug(),"hello get world",worldTask.mCoroutine.promise().mRetValue;
-    debug(),"done world";
-    debug(), "hello 42";
-    co_yield 42;
-    debug(), "hello 12";
-    co_yield 12;
-    debug(),"hello ending";
-   
+Task<double> world() {
+    debug(), "world";
+    co_return 3.14;
 }
 
-int main(){
- 
-    debug(),"main coming"; 
-    Task t=hello();
-    debug(),"main done";
-    while(!t.mCoroutine.done()){
-    t.mCoroutine.resume();
-    debug(),"main get",t.mCoroutine.promise().mRetValue;
+Task<int> hello() {
+    auto ret = co_await baby();
+    debug(), ret;
+    int i = (int)co_await world();
+    debug(), "hello得到world结果为", i;
+    co_return i + 1;
+}
+
+int main() {
+    debug(), "main即将调用hello";
+    auto t = hello();
+    debug(), "main调用完了hello"; 
+    while (!t.mCoroutine.done()) {
+        t.mCoroutine.resume();
+        debug(), "main得到hello结果为",
+            t.mCoroutine.promise().result();
     }
     return 0;
 }
