@@ -1,176 +1,117 @@
-#include <chrono>
-#include <coroutine>
-#include "debug.hpp"
+#include <co_async/debug.hpp>
+#include <co_async/task.hpp>
+#include <co_async/when_all.hpp>
+#include <co_async/when_any.hpp>
+#include <co_async/and_then.hpp>
+#include <cerrno>
+#include <sys/epoll.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
 
-struct RepeatAwaiter {
-    bool await_ready() const noexcept { return false; }
-
-    std::coroutine_handle<> await_suspend(std::coroutine_handle<> coroutine) const noexcept {
-        if (coroutine.done())
-            return std::noop_coroutine();
-        else
-            return coroutine;
-    }
-
-    void await_resume() const noexcept {}
-};
-
-struct PreviousAwaiter {
-    std::coroutine_handle<> mPrevious;
-
-    bool await_ready() const noexcept { return false; }
-
-    std::coroutine_handle<> await_suspend(std::coroutine_handle<> coroutine) const noexcept {
-        if (mPrevious)
-            return mPrevious;
-        else
-            return std::noop_coroutine();
-    }
-
-    void await_resume() const noexcept {}
-};
-
-template <class T>
-struct Promise {
-    auto initial_suspend() noexcept {
-        return std::suspend_always();
-    }
-
-    auto final_suspend() noexcept {
-        return PreviousAwaiter(mPrevious);
-    }
-
-    void unhandled_exception() noexcept {
-        mException = std::current_exception();
-    }
-
-    auto yield_value(T ret) noexcept {
-        new (&mResult) T(std::move(ret));
-        return std::suspend_always();
-    }
-
-    void return_value(T ret) noexcept {
-        new (&mResult) T(std::move(ret));
-    }
-
-    T result() {
-        if (mException) [[unlikely]] {
-            std::rethrow_exception(mException);
-        }
-        T ret = std::move(mResult);
-        mResult.~T();
-        return ret;
-    }
-
-    std::coroutine_handle<Promise> get_return_object() {
-        return std::coroutine_handle<Promise>::from_promise(*this);
-    }
-
-    std::coroutine_handle<> mPrevious{};
-    std::exception_ptr mException{};
-    union {
-        T mResult;
-    };
-
-    Promise() noexcept {}
-    Promise(Promise &&) = delete;
-    ~Promise() {}
-};
-
-template <>
-struct Promise<void> {
-    auto initial_suspend() noexcept {
-        return std::suspend_always();
-    }
-
-    auto final_suspend() noexcept {
-        return PreviousAwaiter(mPrevious);
-    }
-
-    void unhandled_exception() noexcept {
-        mException = std::current_exception();
-    }
-
-    void return_void() noexcept {
-    }
-
-    void result() {
-        if (mException) [[unlikely]] {
-            std::rethrow_exception(mException);
-        }
-    }
-
-    std::coroutine_handle<Promise> get_return_object() {
-        return std::coroutine_handle<Promise>::from_promise(*this);
-    }
-
-    std::coroutine_handle<> mPrevious{};
-    std::exception_ptr mException{};
-
- 
-};
-
-template <class T>
-struct Task {
-    using promise_type = Promise<T>;
-
-    Task(std::coroutine_handle<promise_type> coroutine) noexcept
-        : mCoroutine(coroutine) {}
-
-    Task(Task &&) = delete;
-
-    ~Task() {
-        mCoroutine.destroy();
-    }
-
-    struct Awaiter {
-        bool await_ready() const noexcept { return false; }
-
-        std::coroutine_handle<promise_type> await_suspend(std::coroutine_handle<> coroutine) const noexcept {
-            mCoroutine.promise().mPrevious = coroutine;
-            return mCoroutine;
-        }
-
-        T await_resume() const {
-            return mCoroutine.promise().result();
-        }
-
-        std::coroutine_handle<promise_type> mCoroutine;
-    };
-
-    auto operator co_await() const noexcept {
-        return Awaiter(mCoroutine);
-    }
-
-    std::coroutine_handle<promise_type> mCoroutine;
-};
-
-Task<std::string> baby() {
-    debug(), "baby";
-    co_return "aaa\n";
+namespace co_async{
+auto checkError(auto res){
+    if(res==-1) [[unlikely]]{
+        throw std::system_error(errno,std::system_category());
+}
+return res;
 }
 
-Task<double> world() {
-    debug(), "world";
-    co_return 3.14;
+struct EpollFilePromise:Promise<void>{
+    auto get_return_object(){
+        return std::coroutine_handle<EpollFilePromise>::from_promise(*this);
+    }
+
+    EpollFilePromise &operator=(EpollFilePromise &&)=delete;
+
+    int mFileNo;
+    uint32_t mEvents;
+};
+
+struct EpollLoop{
+    void addListener(EpollFilePromise &promise){
+        struct epoll_event event;
+        event.events=promise.mEvents;
+        event.data.ptr=&promise;
+        checkError(epoll_ctl(mEpoll,EPOLL_CTL_ADD,promise.mFileNo,&event));
+    }
+
+    void tryRun(){
+        struct epoll_event ebuf[10];
+        int res=checkError(epoll_wait(mEpoll,ebuf,10,-1));
+        for(int i=0;i<res;i++){
+            auto &event=ebuf[i];
+            auto& promise=*(EpollFilePromise *)event.data.ptr;
+            checkError(epoll_ctl(mEpoll,EPOLL_CTL_DEL,promise.mFileNo,NULL));
+            std::coroutine_handle<EpollFilePromise>::from_promise(promise).resume();
+        }
+    }
+
+         EpollLoop &operator=(EpollLoop &&) = delete;
+         ~EpollLoop(){
+            close(mEpoll);
+         }
+           int mEpoll = checkError(epoll_create1(0));
+    };
+
+    struct EpollFileAwaiter{
+        bool await_ready() const noexcept{
+            return false;
+        }
+
+        void await_suspend(std::coroutine_handle<EpollFilePromise> coroutine) const{
+            auto &promise=coroutine.promise();
+            promise.mFileNo=mFileNo;
+            promise.mEvents=mEvents;
+            loop.addListener(promise);
+        }
+
+        void await_resume() const noexcept{};
+
+        EpollLoop &loop;
+        int mFileNo;
+        uint32_t mEvents;
+    };
+
+    inline Task<void,EpollFilePromise>  wait_file(EpollLoop &loop,int fileNo,uint32_t events){
+        co_await EpollFileAwaiter(loop,fileNo,events);
+    }
 }
 
-Task<int> hello() {
-    auto ret = co_await baby();
-    debug(), ret;
-    int i = (int)co_await world();
-    debug(), "hello得到world结果为", i;
-    co_return i + 1;
+co_async::EpollLoop loop;
+
+co_async::Task<std::string> reader() {
+    co_await wait_file(loop, 0, EPOLLIN);
+    std::string s;
+    while (true) {
+        char c;
+        ssize_t len = read(0, &c, 1);
+        if (len == -1) {
+            if (errno != EWOULDBLOCK) [[unlikely]] {
+                throw std::system_error(errno, std::system_category());
+            }
+            break;
+        }
+        s.push_back(c);
+    }
+    co_return s;
+}
+co_async::Task<void> async_main() {
+    while (true) {
+        auto s = co_await reader();
+        debug(), "读到了", s;
+        if (s == "quit\n") break;
+    }
 }
 
 int main() {
-    debug(), "main即将调用hello";
-    auto t = hello();
-    debug(), "main调用完了hello"; 
+    int attr = 1;
+    ioctl(0, FIONBIO, &attr);
+
+    auto t = async_main();
+    t.mCoroutine.resume();
     while (!t.mCoroutine.done()) {
-        t.mCoroutine.resume();
-        debug(), "main得到hello结果为",
-            t.mCoroutine.promise().result();
+        loop.tryRun();
     }
+
     return 0;
 }
